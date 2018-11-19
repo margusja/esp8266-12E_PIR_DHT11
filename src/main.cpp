@@ -1,99 +1,73 @@
-// Example testing sketch for various DHT humidity/temperature sensors
-// Written by ladyada, public domain
 
-#include "DHT.h"
-#include <ESP8266WiFi.h>
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
+
+//needed for library
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+
+#include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
 #include <PubSubClient.h>
 
-#define DHTPIN 4     // what digital pin we're connected to DHT11. 4 goes to nodemcu GPIO-4
+// Replace with your network credentials
+const char* ssid     = "varmar";
+const char* password = "xxx";
+char hostname[] = "Liikumisandur2";
 
-const char* ssid = "varmar";
-const char* password = "XXXXXXX";
-const char* mqtt_server = "192.168.1.127";
+#define INPUT_PIN 4 // PIR data pin goes to nodemcu GPIO-2
 
-#define INPUT_PIN 2 // PIR data pin goes to nodemcu GPIO-2
-#define IDX 26 // IDX in domoticz
-int oldInputState;
+// Set web server port number to 80
+ESP8266WebServer server(80);
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-long lastMsg = 0;
-char msg[50];
-int value = 0;
+
+uint addr = 0;
+
+// fake data
+struct {
+  uint mqtt_port = 0;
+  uint idx = 0;
+  char mqtt_server[20] = "";
+  uint config = 0;
+} data;
 
 String temp_str;
 char temp[80];
 
-// Uncomment whatever type you're using!
-//#define DHTTYPE DHT11   // DHT 11
-#define DHTTYPE DHT11   // DHT 22  (AM2302), AM2321
-//#define DHTTYPE DHT21   // DHT 21 (AM2301)
+int oldInputState;
 
-// Connect pin 1 (on the left) of the sensor to +5V
-// NOTE: If using a board with 3.3V logic like an Arduino Due connect pin 1
-// to 3.3V instead of 5V!
-// Connect pin 2 of the sensor to whatever your DHTPIN is
-// Connect pin 4 (on the right) of the sensor to GROUND
-// Connect a 10K resistor from pin 2 (data) to pin 1 (power) of the sensor
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
 
-// Initialize DHT sensor.
-// Note that older versions of this library took an optional third parameter to
-// tweak the timings for faster processors.  This parameter is no longer needed
-// as the current DHT reading algorithm adjusts itself to work on faster procs.
-DHT dht(DHTPIN, DHTTYPE);
 
-void setup_wifi() {
-
-  delay(10);
-  // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  randomSeed(micros());
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+void handleRoot() {
+  server.send(200, "text/plain", "hello from esp8266! \n\n http://IP/set?mqtt_server=[MQTT SERVER]&mqtt_port=[MQTT port]&idx=[IDX]");
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+void handleNotFound() {
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
-  Serial.println();
-
-  // Switch on the LED if an 1 was received as first character
-  if ((char)payload[0] == '1') {
-    digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
-    // but actually the LED is on; this is because
-    // it is active low on the ESP-01)
-  } else {
-    digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
-  }
-
+  server.send(404, "text/plain", message);
 }
 
 void reconnect() {
   // Loop until we're reconnected
-  while (!client.connected()) {
+  while (!mqtt_client.connected()) {
+    server.handleClient(); // give a chance to set mqtt server
     Serial.print("Attempting MQTT connection...");
     // Create a random client ID
     String clientId = "ESP8266Client-";
     clientId += String(random(0xffff), HEX);
     // Attempt to connect
-    if (client.connect(clientId.c_str())) {
+    if (mqtt_client.connect(clientId.c_str())) {
       Serial.println("connected");
       // Once connected, publish an announcement...
       //client.publish("tele/esp8266_sensor_test/temp", "23");
@@ -101,7 +75,7 @@ void reconnect() {
       //client.subscribe("inTopic");
     } else {
       Serial.print("failed, rc=");
-      Serial.print(client.state());
+      Serial.print(mqtt_client.state());
       Serial.println(" try again in 5 seconds");
       // Wait 5 seconds before retrying
       delay(5000);
@@ -109,80 +83,87 @@ void reconnect() {
   }
 }
 
+
 void setup() {
+  // put your setup code here, to run once:
   Serial.begin(115200);
-  Serial.println("DHTxx test!");
 
-  pinMode(BUILTIN_LED, OUTPUT);     // Initialize the BUILTIN_LED pin as an output
+  // commit 512 bytes of ESP8266 flash (for "EEPROM" emulation)
+  // this step actually loads the content (512 bytes) of flash into
+  // a 512-byte-array cache in RAM
+  EEPROM.begin(512);
 
-  setup_wifi();
+  // read bytes (i.e. sizeof(data) from "EEPROM"),
+  // in reality, reads from byte-array cache
+  // cast bytes into structure called data
+  EEPROM.get(addr,data);
+  Serial.println("Old values are: "+String(data.idx)+","+String(data.mqtt_port)+","+String(data.mqtt_server));
 
-  pinMode(INPUT_PIN, INPUT);
-  digitalWrite(INPUT_PIN, LOW); // turns on pulldown. At least in arduino-uno board
+  // Connect to Wi-Fi network with SSID and password
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
 
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
+  wifi_station_set_hostname(hostname);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
 
-  dht.begin();
+  // Print local IP address and start web server
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  server.begin();
+
+  if (MDNS.begin("esp8266")) {
+    Serial.println("MDNS responder started");
+  }
+
+  server.on("/", handleRoot);
+
+  server.on("/set", []() {
+    Serial.println(server.arg(0));
+    Serial.println(server.arg(1));
+    Serial.println(server.arg(2));
+    server.arg(0).toCharArray(data.mqtt_server, 20);
+    data.mqtt_port = server.arg(1).toInt();
+    data.idx = server.arg(2).toInt();
+    data.config = true;
+    EEPROM.put(addr,data);
+    EEPROM.commit();
+
+    server.send(200, "text/plain", "Done");
+  });
+
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("HTTP server started");
+
+  mqtt_client.setServer(data.mqtt_server, data.mqtt_port);
+
 }
 
 void loop() {
+  server.handleClient();
 
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
+   if (!mqtt_client.connected() && data.config == 1) {
+     reconnect();
+   }
+   mqtt_client.loop();
 
-  int inputState = digitalRead(INPUT_PIN);
+   int inputState = digitalRead(INPUT_PIN);
 
-  if (inputState != oldInputState) {
-    if (inputState == 1)
-      client.publish("domoticz/in", "{\"idx\":26,\"nvalue\":0,\"svalue\":\"1\",\"Battery\":48,\"RSSI\":5}");
-    else if (inputState == 0)
-      client.publish("domoticz/in", "{\"idx\":26,\"nvalue\":0,\"svalue\":\"0\",\"Battery\":48,\"RSSI\":5}");
-    oldInputState = inputState;
-  }
+   if (inputState != oldInputState) {
 
-  // Wait a few seconds between measurements.
-  delay(2000);
+     // This sends off your payload.
+     temp_str = "{\"idx\":"+ String(data.idx) +",\"nvalue\":0,\"svalue\": \"" + String(inputState) + "\",\"Battery\":48,\"RSSI\":5}"; //converting ftemp (the float variable above) to a string
+     temp_str.toCharArray(temp, temp_str.length() + 1); //packaging up the data to publish to mqtt whoa..
+     mqtt_client.publish("domoticz/in", temp);
 
-  // Reading temperature or humidity takes about 250 milliseconds!
-  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
-  float h = dht.readHumidity();
-  // Read temperature as Celsius (the default)
-  float t = dht.readTemperature();
-  // Read temperature as Fahrenheit (isFahrenheit = true)
-  float f = dht.readTemperature(true);
+     oldInputState = inputState;
+   }
 
-  // Check if any reads failed and exit early (to try again).
-  if (isnan(h) || isnan(t) || isnan(f)) {
-    Serial.println("Failed to read from DHT sensor!");
-    return;
-  }
-
-  // Compute heat index in Fahrenheit (the default)
-  float hif = dht.computeHeatIndex(f, h);
-  // Compute heat index in Celsius (isFahreheit = false)
-  float hic = dht.computeHeatIndex(t, h, false);
-
-  Serial.print("Humidity: ");
-  Serial.print(h);
-  Serial.print(" %\t");
-  Serial.print("Temperature: ");
-  Serial.print(t);
-  Serial.print(" *C ");
-  Serial.print(f);
-  Serial.print(" *F\t");
-  Serial.print("Heat index: ");
-  Serial.print(hic);
-  Serial.print(" *C ");
-  Serial.print(hif);
-  Serial.println(" *F");
-
-  // This sends off your payload.
-  temp_str = "{\"idx\":28,\"nvalue\":0,\"svalue\": \"" + String(t) + "\",\"Battery\":48,\"RSSI\":5}"; //converting ftemp (the float variable above) to a string
-
-  temp_str.toCharArray(temp, temp_str.length() + 1); //packaging up the data to publish to mqtt whoa..
-  //"{\"idx\":27,\"nvalue\":0,\"svalue\": \" + t + \",\"Battery\":48,\"RSSI\":5}"
-  client.publish("domoticz/in", temp);
 }
